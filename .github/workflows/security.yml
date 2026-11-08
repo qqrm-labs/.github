@@ -4,9 +4,15 @@ on:
   workflow_call:
     inputs:
       language:
+        description: CodeQL language, or required comma-separated languages in default mode
         required: false
         type: string
         default: 'rust'
+      codeql-mode:
+        description: advanced, default (GitHub-managed), or unavailable (private repositories only)
+        required: false
+        type: string
+        default: advanced
 
 permissions: {}
 
@@ -273,7 +279,174 @@ jobs:
           advanced-security: false
           min-severity: medium
 
+  codeql-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run-advanced: ${{ steps.policy.outputs.run-advanced }}
+    steps:
+      - name: Verify the CodeQL execution mode
+        id: policy
+        shell: python
+        env:
+          CODEQL_MODE: ${{ inputs.codeql-mode }}
+          CODEQL_LANGUAGES: ${{ inputs.language }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEQL_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # BEGIN CODEQL MODE POLICY
+          import json
+          import os
+          import re
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          NATIVE_PATH = "dynamic/github-code-scanning/codeql"
+
+          def validate_mode(mode, private, language):
+              if mode not in {"advanced", "default", "unavailable"}:
+                  raise RuntimeError("Unknown codeql-mode; expected advanced, default, or unavailable")
+              languages = [part.strip() for part in language.split(",")]
+              if not languages or any(not re.fullmatch(r"[a-z]+(?:-[a-z]+)*", item) for item in languages):
+                  raise RuntimeError("CodeQL languages must be nonempty canonical language names")
+              if len(set(languages)) != len(languages):
+                  raise RuntimeError("Duplicate CodeQL language")
+              if mode == "unavailable" and private != "true":
+                  raise RuntimeError("Unavailable CodeQL is permitted only for an explicitly private repository")
+              return languages
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          def get_json(path):
+              request = Request(os.environ["GITHUB_API_URL"].rstrip("/") + path, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              try:
+                  with build_opener(NoRedirect()).open(request, timeout=20) as response:
+                      return json.load(response)
+              except (HTTPError, URLError) as error:
+                  code = getattr(error, "code", "network error")
+                  raise RuntimeError(f"GitHub Actions API failed ({code}); delegated CodeQL is unverified") from None
+
+          def records(path, key):
+              result = []
+              separator = "&" if "?" in path else "?"
+              for page in range(1, 11):
+                  data = get_json(f"{path}{separator}per_page=100&page={page}")
+                  items = data.get(key)
+                  if not isinstance(items, list):
+                      raise RuntimeError(f"GitHub Actions API did not return {key}")
+                  result.extend(items)
+                  if len(items) < 100:
+                      return result
+              raise RuntimeError("GitHub Actions API pagination limit exceeded; CodeQL is unverified")
+
+          def current_scan_required(event, ref, default_branch, protected, repository,
+                                    head_repository="", base_ref=""):
+              if event not in {"push", "pull_request", "workflow_dispatch", "schedule"}:
+                  raise RuntimeError("Default CodeQL delegation does not support this event")
+              if not default_branch or protected not in {"true", "false"}:
+                  raise RuntimeError("Missing repository branch context for Default CodeQL")
+              if event == "pull_request":
+                  if not repository or not head_repository or not base_ref:
+                      raise RuntimeError("Missing pull-request repository or base branch context")
+                  # A target repository can itself be a fork; compare identities.
+                  if head_repository.lower() != repository.lower():
+                      return False
+                  if base_ref == default_branch:
+                      return True
+                  branch = get_json(f"/repos/{repository}/branches/{quote(base_ref, safe='')}")
+                  if not isinstance(branch.get("protected"), bool):
+                      raise RuntimeError("Base-branch protection could not be verified")
+                  return branch["protected"]
+              return (
+                  ref.startswith("refs/heads/") and
+                  (ref == "refs/heads/" + default_branch or protected == "true")
+              )
+
+          def require_analysis_jobs(run, jobs, languages):
+              if run.get("conclusion") != "success":
+                  raise RuntimeError("The native Default CodeQL run did not complete successfully")
+              for language in languages:
+                  matching = [job for job in jobs if job.get("name") == f"Analyze ({language})"]
+                  if (len(matching) != 1 or matching[0].get("status") != "completed"
+                          or matching[0].get("conclusion") != "success"):
+                      raise RuntimeError(f"Native Default CodeQL did not complete analysis for {language}")
+
+          def verify_default(languages):
+              repo = "/repos/" + os.environ["GITHUB_REPOSITORY"]
+              workflows = records(repo + "/actions/workflows", "workflows")
+              native = [item for item in workflows if item.get("path") == NATIVE_PATH]
+              if len(native) != 1 or native[0].get("state") != "active":
+                  raise RuntimeError("An active GitHub-managed Default CodeQL workflow is required")
+              required = current_scan_required(
+                  os.environ["GITHUB_EVENT_NAME"], os.environ["GITHUB_REF"],
+                  os.environ["DEFAULT_BRANCH"], os.environ["GITHUB_REF_PROTECTED"],
+                  os.environ["GITHUB_REPOSITORY"], os.environ.get("PR_HEAD_REPOSITORY", ""),
+                  os.environ.get("PR_BASE_REF", ""),
+              )
+              if not required:
+                  return ("GitHub-managed Default CodeQL is active. This event is outside Default setup's "
+                          "trigger scope; no CodeQL analysis is claimed for this event.")
+
+              sha = os.environ["CODEQL_HEAD_SHA"]
+              if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  raise RuntimeError("A full source commit SHA is required to verify Default CodeQL")
+              path = f"{repo}/actions/workflows/{native[0]['id']}/runs?head_sha={sha}"
+              deadline = time.monotonic() + 12 * 60
+              while True:
+                  runs = [run for run in records(path, "workflow_runs")
+                          if run.get("path") == NATIVE_PATH and run.get("head_sha") == sha]
+                  run = max(runs, key=lambda item: item["id"]) if runs else None
+                  if run and run.get("status") == "completed":
+                      jobs = records(f"{repo}/actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+                      require_analysis_jobs(run, jobs, languages)
+                      return (f"GitHub-managed Default CodeQL completed for `{sha}` with "
+                              f"languages: {', '.join(languages)}. Native run: {run['html_url']}. "
+                              "The separate CodeQL result check evaluates findings; this policy "
+                              "check does not assert that the code has no vulnerabilities.")
+                  if time.monotonic() >= deadline:
+                      raise RuntimeError("No completed native Default CodeQL analysis for this commit within 12 minutes")
+                  print("Waiting for the independent native Default CodeQL run...", flush=True)
+                  time.sleep(15)
+
+          def main():
+              mode = os.environ["CODEQL_MODE"]
+              languages = validate_mode(mode, os.environ["REPOSITORY_PRIVATE"], os.environ["CODEQL_LANGUAGES"])
+              if mode == "default":
+                  message = verify_default(languages)
+              elif mode == "unavailable":
+                  message = ("CodeQL was NOT run: this private repository explicitly declares Code Security "
+                             "unavailable. This is a coverage limitation, not a successful CodeQL scan. "
+                             "Gitleaks and workflow security remain independent blocking checks.")
+                  print("::notice::" + message)
+              else:
+                  message = "Advanced CodeQL analysis is required and runs in the dependent codeql job."
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write(f"## CodeQL execution mode: {mode}\n\n{message}\n")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"run-advanced={'true' if mode == 'advanced' else 'false'}\n")
+
+          if __name__ == "__main__":
+              main()
+          # END CODEQL MODE POLICY
+
   codeql:
+    needs: codeql-policy
+    if: ${{ needs.codeql-policy.outputs.run-advanced == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
