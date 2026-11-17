@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       language:
-        description: CodeQL language, or required comma-separated languages in default mode
+        description: Comma-separated CodeQL languages to analyze or verify
         required: false
         type: string
         default: 'rust'
@@ -287,6 +287,7 @@ jobs:
       contents: read
     outputs:
       run-advanced: ${{ steps.policy.outputs.run-advanced }}
+      languages: ${{ steps.policy.outputs.languages }}
     steps:
       - name: Verify the CodeQL execution mode
         id: policy
@@ -439,6 +440,7 @@ jobs:
                   summary.write(f"## CodeQL execution mode: {mode}\n\n{message}\n")
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
                   output.write(f"run-advanced={'true' if mode == 'advanced' else 'false'}\n")
+                  output.write(f"languages={json.dumps(languages)}\n")
 
           if __name__ == "__main__":
               main()
@@ -448,6 +450,10 @@ jobs:
     needs: codeql-policy
     if: ${{ needs.codeql-policy.outputs.run-advanced == 'true' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.codeql-policy.outputs.languages) }}
     permissions:
       actions: read
       contents: read
@@ -458,9 +464,10 @@ jobs:
           persist-credentials: false
       - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
-          languages: ${{ inputs.language }}
+          languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
       - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
-          category: /language:${{ inputs.language }}
+          category: /language:${{ matrix.language }}
+

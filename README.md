@@ -14,9 +14,17 @@ The `codeql-mode` input is explicit and defaults to `advanced`:
 | `default` | Keep GitHub-managed Default setup and verify its independent analysis instead of uploading a duplicate advanced analysis. |
 | `unavailable` | Do not run CodeQL in a private repository that explicitly declares Code Security unavailable. The job summary records this coverage limitation. Public repositories cannot select this mode. |
 
-`language` retains its existing meaning in advanced mode. In default mode it is
-the comma-separated list of required native analysis jobs, for example
-`rust,actions` or `c-cpp`.
+`language` is a comma-separated list, for example `rust,actions` or `c-cpp`.
+Advanced mode validates the list and analyzes each language in a separate matrix
+job with `build-mode: none`, `security-extended` queries, and a distinct result
+category. All languages run even if another language fails. Default mode uses
+the list to verify that every required native analysis job completed.
+
+GitHub Default setup does not run on Dependabot pull requests. Callers requiring
+an actual scan for those pull requests must switch the repository to advanced
+setup and select `codeql-mode: advanced`. Run on `pull_request` and pushes to the
+default branch; Dependabot branch pushes cannot upload CodeQL results. Preserve
+a scheduled trigger in the caller if periodic scans are required.
 
 Default mode requires an active workflow with GitHub's native
 `dynamic/github-code-scanning/codeql` path. For same-repository pull requests
@@ -40,3 +48,4 @@ Gitleaks and workflow security continue as independent blocking checks.
 Run `python3 -m unittest discover -s tests -v` to exercise the exact inline policy,
 including rejection controls. The self-test workflow also runs actionlint and
 the full reusable workflow with the default advanced mode.
+
