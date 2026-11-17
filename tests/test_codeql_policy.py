@@ -186,19 +186,46 @@ class CodeQLPolicyTests(unittest.TestCase):
             with patch.dict(os.environ, context, clear=True), patch.object(POLICY, "get_json") as api:
                 POLICY.main()
                 api.assert_not_called()
-            self.assertEqual(output.read_text(), "run-advanced=false\n")
+            self.assertEqual(output.read_text(), 'run-advanced=false\nlanguages=["rust"]\n')
             self.assertIn("CodeQL was NOT run", summary.read_text())
             self.assertIn("coverage limitation", summary.read_text())
             output.unlink()
             with patch.dict(os.environ, context | {"CODEQL_MODE": "advanced", "REPOSITORY_PRIVATE": "false"}, clear=True):
                 POLICY.main()
-            self.assertEqual(output.read_text(), "run-advanced=true\n")
+            self.assertEqual(output.read_text(), 'run-advanced=true\nlanguages=["rust"]\n')
             output.unlink()
             with patch.dict(os.environ, context | {"REPOSITORY_PRIVATE": "false"}, clear=True), \
                     self.assertRaises(RuntimeError):
                 POLICY.main()
             self.assertFalse(output.exists())
 
+    def test_advanced_emits_each_validated_language_for_the_matrix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            context = {"CODEQL_MODE": "advanced", "CODEQL_LANGUAGES": " rust, actions ",
+                       "REPOSITORY_PRIVATE": "false", "GITHUB_OUTPUT": str(output),
+                       "GITHUB_STEP_SUMMARY": str(Path(temporary) / "summary")}
+            with patch.dict(os.environ, context, clear=True), patch.object(POLICY, "get_json") as api:
+                POLICY.main()
+                api.assert_not_called()
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(values["run-advanced"], "true")
+            self.assertEqual(json.loads(values["languages"]), ["rust", "actions"])
+
+    def test_invalid_advanced_languages_never_create_a_matrix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            context = {"CODEQL_MODE": "advanced", "REPOSITORY_PRIVATE": "false",
+                       "GITHUB_OUTPUT": str(output),
+                       "GITHUB_STEP_SUMMARY": str(Path(temporary) / "summary")}
+            for languages in ("", "rust,", "rust,rust", 'rust,actions"]', "rust\nrun-advanced=false"):
+                with self.subTest(languages=languages), \
+                        patch.dict(os.environ, context | {"CODEQL_LANGUAGES": languages}, clear=True), \
+                        self.assertRaises(RuntimeError):
+                    POLICY.main()
+                self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+
